@@ -12,19 +12,79 @@ must ride in the prompt. The proxy flattens the full message list into a
 single labeled transcript that the model can read.
 """
 
-import asyncio, json, uuid, argparse
+import asyncio, json, os, uuid, argparse
 from aiohttp import web
 
-OPENCODE_CLI = r"~\AppData\Roaming\ai.opencode.desktop\cli\2.0.11\opencode-cli.exe"
-WORK_DIR = r"~\Documents"
+OPENCODE_CLI = os.path.expandvars(
+    r"%APPDATA%\ai.opencode.desktop\cli\2.0.11\opencode-cli.exe"
+)
+WORK_DIR = os.path.expandvars(r"%USERPROFILE%\Documents")
 PER_READ_TIMEOUT = 180  # seconds between opencode output lines
+
+DEFAULT_MODEL = "longcat-2.5-preview-free"
+
+# Free-tier models, verified live against the CLI on 2026-09-28.
+# Excluded by request: big-pickle, muse-spark-*-contributor-free (Meta).
+# Advertised by OpenCode but DEAD (`provider.no-route`) — kept in DEAD_MODELS
+# so callers get a clear message instead of an opaque 502:
+#   mimo-v2.5-free, deepseek-v4-flash-free, jev-1.13-free
+FREE_MODELS = [
+    "longcat-2.5-preview-free",     # 1M ctx, multimodal, zero data retention
+    "space-bunny-free",             # stealth, zero-retention provider
+    "mimo-v2.6-flash-free",
+    "ling-3.0-flash-fin-free",
+    "nemotron-3-ultra-free",
+    "nemotron-3.5-lightning-free",
+]
+
+DEAD_MODELS = {
+    "mimo-v2.5-free": "Model retired by OpenCode (provider.no-route).",
+    "deepseek-v4-flash-free": "Model retired by OpenCode (provider.no-route).",
+    "jev-1.13-free": "System One model - not a chat model, unreachable via CLI.",
+}
+
+# Short aliases so `/model longcat` etc. resolve.
+ALIASES = {
+    "longcat": "longcat-2.5-preview-free",
+    "longcat-2.5": "longcat-2.5-preview-free",
+    "bunny": "space-bunny-free",
+    "space-bunny": "space-bunny-free",
+    "mimo": "mimo-v2.6-flash-free",
+    "ling": "ling-3.0-flash-fin-free",
+    "nemotron": "nemotron-3-ultra-free",
+    "nemotron-3-ultra": "nemotron-3-ultra-free",
+}
+
+
+def resolve_model(name):
+    """Map a requested model id onto a known-live free model id."""
+    name = (name or DEFAULT_MODEL).strip()
+    if name.startswith("opencode/"):
+        name = name[len("opencode/"):]
+    if name.startswith("opencode-go/"):
+        name = name[len("opencode-go/"):]
+    return ALIASES.get(name.lower(), name)
+
+
+def cli_env():
+    """Subprocess env with the MSYS PWD var fixed.
+
+    opencode-cli.exe chdir()s to $PWD. Under Git-Bash/MSYS PWD is a POSIX
+    path ('/c/Users/...') that the Windows binary cannot chdir into, and every
+    call dies with 'Failed to change directory to /c/Users/...'. Pointing PWD
+    at a native path makes the binary chdir cleanly.
+    """
+    env = dict(os.environ)
+    env["PWD"] = WORK_DIR
+    return env
 
 
 async def run_opencode(model, text):
     """Yield text deltas as opencode emits them on stdout."""
     cmd = [OPENCODE_CLI, "run", "--format", "json", "--model", f"opencode/{model}", text]
     proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, cwd=WORK_DIR
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        cwd=WORK_DIR, env=cli_env(),
     )
     sent = ""
 
@@ -41,6 +101,11 @@ async def run_opencode(model, text):
                 obj = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if obj.get("type") == "error":
+                err = obj.get("error", {})
+                raise RuntimeError(
+                    f"{err.get('type', 'error')}: {err.get('message', 'unknown error')}"
+                )
             if obj.get("type") == "text":
                 part = obj.get("part", {})
                 new = part.get("text", obj.get("text", ""))
@@ -102,12 +167,21 @@ def flatten_history(msgs):
 
 async def handle_chat(request):
     body = await request.json()
-    model = body.get("model", "big-pickle")
+    requested = body.get("model") or DEFAULT_MODEL
+    model = resolve_model(requested)
     stream = body.get("stream", False)
     msgs = body.get("messages", [])
     text = flatten_history(msgs) or "Hello"
 
-    print(f"[proxy] {'stream' if stream else 'block '} {model}: {text[:60]!r}", flush=True)
+    if model in DEAD_MODELS:
+        return web.json_response(
+            {"error": {"message": DEAD_MODELS[model], "type": "model_not_found",
+                       "code": "model_dead", "param": "model"}},
+            status=503,
+        )
+
+    print(f"[proxy] {'stream' if stream else 'block '} {requested}->{model}: {text[:60]!r}",
+          flush=True)
     cid = f"chatcmpl-{uuid.uuid4().hex[:24]}"
 
     if not stream:
@@ -166,16 +240,23 @@ async def handle_chat(request):
 
 async def handle_models(request):
     return web.json_response({"object": "list", "data": [
-        {"id": m, "object": "model"} for m in [
-            "big-pickle", "muse-spark-1.3-contributor-free",
-            "muse-spark-1.2-contributor-free", "mimo-v2.5-free",
-            "deepseek-v4-flash-free",
-        ]
+        {"id": m, "object": "model", "created": 0, "owned_by": "opencode"}
+        for m in FREE_MODELS
+    ] + [
+        {"id": a, "object": "model", "created": 0, "owned_by": "opencode-alias"}
+        for a in ALIASES
     ]})
 
 
 async def health(request):
-    return web.json_response({"status": "ok"})
+    return web.json_response({
+        "status": "ok",
+        "default_model": DEFAULT_MODEL,
+        "free_models": FREE_MODELS,
+        "dead_models": sorted(DEAD_MODELS),
+        "cli": OPENCODE_CLI,
+        "cli_exists": os.path.exists(OPENCODE_CLI),
+    })
 
 
 def main():

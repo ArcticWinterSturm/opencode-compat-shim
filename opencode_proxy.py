@@ -29,14 +29,22 @@ Two hard problems this solves, both verified empirically (2026-09-28):
    tool call.
 """
 
-import asyncio, json, os, uuid, argparse
+import asyncio, json, os, uuid, argparse, re
 from aiohttp import web
 
 OPENCODE_CLI = os.path.expandvars(
     r"%APPDATA%\ai.opencode.desktop\cli\2.0.11\opencode-cli.exe"
 )
-WORK_DIR = os.path.expandvars(r"%USERPROFILE%\Documents")
+# The CLI's own built-in tools (bash/read/write) cannot be disabled in this
+# build and --auto approves their permission prompts. Keep its cwd in a throw-
+# away scratch dir so an alien tool can never touch real user files; Hermes
+# tool calls all use absolute paths anyway.
+WORK_DIR = os.path.expandvars(r"%LOCALAPPDATA%\Temp\oc_shim_cwd")
+os.makedirs(WORK_DIR, exist_ok=True)
 PER_READ_TIMEOUT = 300
+# Transient CLI failures worth a retry: the step watchdog aborts (often after a
+# permission prompt stalled), read timeouts, connection resets.
+TRANSIENT_RE = re.compile(r"interrupt|abort|timeout|econn|reset|timed out", re.I)
 DEFAULT_MODEL = "longcat-2.5-preview-free"
 
 FREE_MODELS = [
@@ -311,7 +319,7 @@ async def run_opencode(model, prompt):
 
     The prompt is written to STDIN, never argv (WinError 206).
     """
-    cmd = [OPENCODE_CLI, "run", "--format", "json",
+    cmd = [OPENCODE_CLI, "run", "--format", "json", "--auto",
            "--model", "opencode/" + model]
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
@@ -373,24 +381,34 @@ async def collect(model, prompt, stream_cb=None):
     """Run one turn. Returns (text, tool_calls, alien_tool_names).
 
     If the model reached for one of the CLI's own tools, the turn is retried
-    once with a corrective nudge appended to the prompt.
+    once with a corrective nudge appended to the prompt. Transient CLI deaths
+    (step watchdog abort, timeout, connection reset) are also retried: without
+    this the partial text of a killed turn is masked as a complete answer and
+    Hermes sees the turn 'finish' with no tool calls.
     """
     alien = []
-    for attempt in range(2):
+    for attempt in range(3):
         sp = Splitter()
         text_parts, tool_raw = [], []
         alien = []
-        async for ev, payload in run_opencode(model, prompt):
-            if ev == "text":
-                for kind, seg in sp.feed(payload):
-                    if kind == "text":
-                        text_parts.append(seg)
-                        if stream_cb:
-                            await stream_cb(seg)
-                    else:
-                        tool_raw.append(seg)
-            elif ev == "alien_tool":
-                alien.append(payload)
+        try:
+            async for ev, payload in run_opencode(model, prompt):
+                if ev == "text":
+                    for kind, seg in sp.feed(payload):
+                        if kind == "text":
+                            text_parts.append(seg)
+                            if stream_cb:
+                                await stream_cb(seg)
+                        else:
+                            tool_raw.append(seg)
+                elif ev == "alien_tool":
+                    alien.append(payload)
+        except ShimError as e:
+            if attempt < 2 and TRANSIENT_RE.search(str(e)):
+                if stream_cb:
+                    await stream_cb(f"\n[shim: CLI died ({e}); retrying turn]\n")
+                continue
+            raise
         for kind, seg in sp.flush():
             if kind == "text":
                 text_parts.append(seg)
@@ -400,7 +418,7 @@ async def collect(model, prompt, stream_cb=None):
                 tool_raw.append(seg)
 
         calls = parse_tool_block("".join(tool_raw))
-        if calls or not alien or attempt == 1:
+        if calls or not alien or attempt == 2:
             return "".join(text_parts), calls, alien
         # The model tried a tool that does not exist in Hermes. Correct it.
         prompt = (prompt + "\n\n[system] Your last attempt tried to use a built-in "
